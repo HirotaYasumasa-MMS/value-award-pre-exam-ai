@@ -4,7 +4,7 @@ import logging
 import json
 import os
 from azure.servicebus import ServiceBusClient, ServiceBusMessage
-from azure.identity import DefaultAzureCredential, ManagedIdentityCredential
+from azure.identity import ManagedIdentityCredential
 from agent_framework import Agent
 from agent_framework.foundry import FoundryChatClient
 from agent_framework.observability import configure_otel_providers
@@ -18,9 +18,6 @@ configure_otel_providers()
 
 app = func.FunctionApp()
 
-SERVICE_BUS_CONNECTION = "ServiceBusConnection"
-RESULT_QUEUE_NAME = "queue-mkcaisb-hirota-valueaward-preexam-result"
-
 _tracer = trace.get_tracer(__name__)
 
 _credential = ManagedIdentityCredential()
@@ -33,7 +30,7 @@ _chat_client = FoundryChatClient(
 
 _risk_compliance_agent = Agent(
     client=_chat_client,
-    name="ValueAwardExamAgent",
+    name="ValueAwardRiskComplianceAgent",
     instructions="""
 # 目的
 - あなたの目的は、提示された応募本文中から下記のチェック観点に該当する記述を検知することです。
@@ -105,7 +102,7 @@ _quality_agent = Agent(
 - あなたの目的は、提示された応募本文中から下記のチェック観点に該当する記述を検知することです。
 # チェック観点
 ## バリューと行動の整合性
-- 候補者が発揮したバリューと応募本文の行動内容との間に致命的な不一致
+- 候補者が発揮したバリューと応募本文の行動内容との間に致命的な不一致がある
 ## 背景・目的と動機の記述
 - 行動の背景および目的についての記載が一切ない
 - 候補者・推薦者自身の「考え」「思い」「気持ち」についての記載が一切ない
@@ -237,7 +234,6 @@ _quality_agent = Agent(
 
 async def run_risk_compliance_agent(action_summary: str, purpose_or_reason: str, action_detail: str) -> dict:
     prompt = json.dumps({
-        "候補者が発揮したバリュー": action_summary,
         "行動のサマリー": action_summary,
         "行動の目的・背景または推薦理由": purpose_or_reason,
         "行動の詳細": action_detail,
@@ -281,13 +277,23 @@ async def run_agents(recommendation_type: str, value_demonstrated: str, action_s
             run_quality_agent(recommendation_type, value_demonstrated, action_summary, purpose_or_reason, action_detail),
         )
 
-        return {"riskCompliance": risk_compliance_result,"quality": quality_result,}
+        return {
+            "examResult":       resolve_exam_result(risk_compliance_result, quality_result),
+            "examResultReason": {
+                "riskCompliance": risk_compliance_result,
+                "quality":        quality_result,
+            },
+        }
 
+def resolve_exam_result(risk_compliance_result: dict, quality_result: dict) -> str:
+    has_risk    = len(risk_compliance_result.get("details", [])) > 0
+    has_quality = len(quality_result.get("details", [])) > 0
+    return "要確認" if (has_risk or has_quality) else "問題なし"
 
 @app.service_bus_queue_trigger(
     arg_name="message",
-    queue_name="queue-mkcaisb-hirota-valueaward-preexam-request",
-    connection="ServiceBusConnection",
+    queue_name="%REQUEST_QUEUE_NAME%",
+    connection="SERVICE_BUS_CONNECTION",
 )
 async def queue_trigger(message: func.ServiceBusMessage):
     body = message.get_body().decode("utf-8")
@@ -297,24 +303,25 @@ async def queue_trigger(message: func.ServiceBusMessage):
     aiexam_id      = data.get("aiExamRecordId")
     app_data       = data.get("applicationData", {})
 
-    exam_result = await run_agents(
+    exam = await run_agents(
         recommendation_type = app_data.get("recommendationType", ""),
-        value_demonstrated = app_data.get("valueDemonstrated", ""),
-        action_summary    = app_data.get("actionSummary", ""),
-        purpose_or_reason = app_data.get("purposeOrReason", ""),
-        action_detail     = app_data.get("actionDetail", ""),
-        aiexam_id         = aiexam_id,
+        value_demonstrated  = app_data.get("valueDemonstrated", ""),
+        action_summary      = app_data.get("actionSummary", ""),
+        purpose_or_reason   = app_data.get("purposeOrReason", ""),
+        action_detail       = app_data.get("actionDetail", ""),
+        aiexam_id           = aiexam_id,
     )
 
     result_payload = {
         "applicationId":  application_id,
         "aiExamRecordId": aiexam_id,
-        "examResult":     exam_result,
+        "examResult":     exam["examResult"],
+        "examResultReason": exam["examResultReason"],
     }
 
-    conn_str = os.environ[SERVICE_BUS_CONNECTION]
+    conn_str = os.environ["SERVICE_BUS_CONNECTION"]
     with ServiceBusClient.from_connection_string(conn_str) as sb_client:
-        with sb_client.get_queue_sender(RESULT_QUEUE_NAME) as sender:
+        with sb_client.get_queue_sender(os.environ["RESULT_QUEUE_NAME"]) as sender:
             sender.send_messages(
                 ServiceBusMessage(json.dumps(result_payload, ensure_ascii=False))
             )
